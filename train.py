@@ -19,6 +19,7 @@ from classifier_model import Resnet18
 from model_search import Network
 from genotypes import PRIMITIVES
 from genotypes import Genotype
+from architect import Architect
 
 
 parser = argparse.ArgumentParser("cifar")
@@ -171,7 +172,6 @@ def main():
                             momentum=0.9, weight_decay=5e-4)
         scheduler_model = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_model, T_max=200)
 
-        print("Lol: " + str(args.init_channels + int(add_width[sp])))
         disc = Network(args.init_channels + int(add_width[sp]), CIFAR_CLASSES, args.layers + int(add_layers[sp]), criterion, switches_normal=switches_normal, switches_reduce=switches_reduce, p=float(drop_rate[sp]))
         disc = nn.DataParallel(disc)
         disc = disc.cuda()
@@ -196,8 +196,14 @@ def main():
         epochs = args.epochs
         eps_no_arch = eps_no_archs[sp]
         scale_factor = 0.2
+
+        architect = Architect(gen, disc, model, network_params, criterion, args)
+        
         for epoch in range(epochs):
             scheduler.step()
+            scheduler_model.step()
+            lr_gen = args.lr
+            lr_disc = args.learning_rate
             lr = scheduler.get_lr()[0]
             lr_model = scheduler_model.get_lr()[0]
             logging.info('Epoch: %d lr: %e lr_model: %e', epoch, lr, lr_model)
@@ -206,11 +212,11 @@ def main():
             if epoch < eps_no_arch:
                 disc.module.p = float(drop_rate[sp]) * (epochs - epoch - 1) / epochs
                 disc.module.update_p()
-                train_acc, train_obj = train(train_queue, valid_queue, gen, model, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, optimizer_model, optimizer_a, lr, lr_model, train_arch=True)
+                train_acc, train_obj = train(train_queue, valid_queue, architect, gen, model, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, optimizer_model, optimizer_a, lr, lr_model, lr_gen, lr_disc, train_arch=True)
             else:
                 disc.module.p = float(drop_rate[sp]) * np.exp(-(epoch - eps_no_arch) * scale_factor) 
                 disc.module.update_p()                
-                train_acc, train_obj = train(train_queue, valid_queue, gen, model, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, optimizer_model, optimizer_a, lr, lr_model, train_arch=True)
+                train_acc, train_obj = train(train_queue, valid_queue, architect, gen, model, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, optimizer_model, optimizer_a, lr, lr_model, lr_gen, lr_disc, train_arch=True)
             logging.info('Train_acc %f', train_acc)
             epoch_duration = time.time() - epoch_start
             logging.info('Epoch time: %ds', epoch_duration)
@@ -347,7 +353,7 @@ def compute_gradient_penalty(D, real_samples, fake_samples):
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
     return gradient_penalty
 
-def train(train_queue, valid_queue, gen, model, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, optimizer_model, optimizer_a, lr, lr_model, train_arch=True):
+def train(train_queue, valid_queue, architect, gen, model, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, optimizer_model, optimizer_a, lr, lr_model, lr_gen, lr_disc, train_arch=True):
     objs = utils.AvgrageMeter()
     top1 = utils.AvgrageMeter()
     top5 = utils.AvgrageMeter()
@@ -373,14 +379,11 @@ def train(train_queue, valid_queue, gen, model, disc, network_params, criterion,
             #  Train Disc Architecture
             # -----------------
             
-            optimizer_a.zero_grad()
+            optimizer_gen.zero_grad()
+            optimizer_disc.zero_grad()
+            optimizer_model.zero_grad()
             
-            # logits = disc(input_search, target_search)
-            # loss_a = criterion(logits, target_search)
-            # loss_a.backward()
-            
-            nn.utils.clip_grad_norm_(disc.module.arch_parameters(), args.grad_clip)
-            optimizer_a.step()
+            architect.step(input, target, input_search, target_search,lr,  lr_gen, lr_disc, lr_model, optimizer_model, optimizer_gen, optimizer_a)
 
         # Adversarial ground truths
         valid = Variable(FloatTensor(batch_size, 1).fill_(1.0), requires_grad=False)
@@ -413,7 +416,7 @@ def train(train_queue, valid_queue, gen, model, disc, network_params, criterion,
         # ---------------------
         #  Train Discriminator
         # ---------------------
-
+        
         optimizer_disc.zero_grad()
 
         # Loss for real images
@@ -428,40 +431,29 @@ def train(train_queue, valid_queue, gen, model, disc, network_params, criterion,
         d_loss = (d_real_loss + d_fake_loss) / 2
 
         d_loss.backward()
+            
         nn.utils.clip_grad_norm_(network_params, args.grad_clip)
         optimizer_disc.step()
 
         # ---------------------
         #  Train Model
         # ---------------------
-
+    
         optimizer_model.zero_grad()
 
-        logits_1 = model(input)
-        m_loss_1 = criterion(logits_1, target)
-
-        # Sample noise and labels as generator input
-        z = Variable(FloatTensor(np.random.normal(0, 1, (batch_size, args.latent_dim))))
-        gen_labels = Variable(LongTensor(np.random.randint(0, CIFAR_CLASSES, batch_size)))
-
-        # Generate a batch of images
-        gen_imgs = gen(z, gen_labels)
-
-        logits_2 = model(gen_imgs)
-        m_loss_2 = gamma * criterion(logits_2, gen_labels)
-
-        m_loss = m_loss_1 + m_loss_2
-        m_loss.backward()
+        loss = architect.compute_loss(input, target)
 
         optimizer_model.step()
 
-        prec1, prec5 = utils.accuracy(logits_1, target, topk=(1, 1))
+        logits = model(input)
+
+        prec1, prec5 = utils.accuracy(logits, target, topk=(1, 1))
         # objs.update(loss.data.item(), n)
         top1.update(prec1.data.item(), n)
         # top5.update(prec5.data.item(), n)
 
         if step % args.report_freq == 0:
-            logging.info('TRAIN Step: %03d R1: %f Gen_loss: %f Disc_loss: %f Model_loss: %f', step, top1.avg, g_loss, d_loss, m_loss)
+            logging.info('TRAIN Step: %03d R1: %f Gen_loss: %f Disc_loss: %f Model_loss: %f', step, top1.avg, g_loss, d_loss, loss)
 
     return top1.avg, objs.avg
 

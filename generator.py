@@ -8,7 +8,7 @@ class Generator(nn.Module):
     def __init__(self, latent_dim, num_classes=10):
         super(Generator, self).__init__()
 
-        self.label_emb = nn.Embedding(num_classes, num_classes)
+        self.label_emb = nn.Embedding(num_classes, 50)
 
         def block(in_feat, out_feat, normalize=True):
             layers = [nn.Linear(in_feat, out_feat)]
@@ -18,7 +18,7 @@ class Generator(nn.Module):
             return layers
 
         self.model = nn.Sequential(
-            *block(latent_dim + num_classes, 128, normalize=False),
+            *block(latent_dim + 50, 128, normalize=False),
             *block(128, 256),
             *block(256, 512),
             *block(512, 1024),
