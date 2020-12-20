@@ -109,10 +109,16 @@ class NetworkCIFAR(nn.Module):
         super(NetworkCIFAR, self).__init__()
         self._layers = layers
         self._auxiliary = auxiliary
+        self._num_classes = num_classes
+        self.label_embedding = nn.Embedding(num_classes, 50)
         stem_multiplier = 3
         C_curr = stem_multiplier*C
+        self.network_head = nn.Sequential(
+          nn.Linear(50, 32*32),
+          nn.LeakyReLU(0.2, inplace=True)
+        )
         self.stem = nn.Sequential(
-            nn.Conv2d(3, C_curr, 3, padding=1, bias=False),
+            nn.Conv2d(4, C_curr, 3, padding=1, bias=False),
             nn.BatchNorm2d(C_curr)
         )        
         C_prev_prev, C_prev, C_curr = C_curr, C_curr, C
@@ -128,24 +134,33 @@ class NetworkCIFAR(nn.Module):
             reduction_prev = reduction
             self.cells += [cell]
             C_prev_prev, C_prev = C_prev, cell.multiplier*C_curr
-            if i == 2*layers//3:
-                C_to_auxiliary = C_prev
-        if auxiliary:
-            self.auxiliary_head = AuxiliaryHeadCIFAR(C_to_auxiliary, num_classes)
+        #     if i == 2*layers//3:
+        #         C_to_auxiliary = C_prev
+        # if auxiliary:
+        #     self.auxiliary_head = AuxiliaryHeadCIFAR(C_to_auxiliary, 1)
         self.global_pooling = nn.AdaptiveAvgPool2d(1)
-        self.classifier = nn.Linear(C_prev, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(C_prev, 1),
+            nn.Sigmoid()
+        )
 
-    def forward(self, input):
-        logits_aux = None
-        s0 = s1 = self.stem(input)
+    def forward(self, input, labels):
+        # logits_aux = None
+        embed = self.label_embedding(labels)
+        head_in = self.network_head(embed)
+        head_in = head_in.view(-1,1,32,32)
+        head_in = torch.cat((input, head_in), dim=1)
+        s0 = s1 = self.stem(head_in)
         for i, cell in enumerate(self.cells):
-            s0, s1 = s1, cell(s0, s1, self.drop_path_prob)
-            if i == 2*self._layers//3:
-                if self._auxiliary and self.training:
-                    logits_aux = self.auxiliary_head(s1)
+            s0, s1 = s1, cell(s0, s1, 0.4)
+            # if i == 2*self._layers//3:
+                # if self._auxiliary and self.training:
+                    # logits_aux = self.auxiliary_head(s1)
         out = self.global_pooling(s1)
         logits = self.classifier(out.view(out.size(0),-1))
-        return logits, logits_aux
+        return logits
 
 class NetworkImageNet(nn.Module):
 

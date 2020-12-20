@@ -82,12 +82,23 @@ class Network(nn.Module):
         super(Network, self).__init__()
         self._C = C
         self._num_classes = num_classes
-        self.label_embedding = nn.Embedding(num_classes, 50)
+        self.label_embedding = nn.Embedding(10, 50)
         self._layers = layers
         self._criterion = criterion
         self._steps = steps
         self._multiplier = multiplier
         self.p = p
+
+        # self.input_conv = torch.nn.Conv2d(3, 128, kernel_size=4, stride=2, padding=1)
+
+        # self.label_conv = torch.nn.Conv2d(1, 128, kernel_size=4, stride=2, padding=1)
+
+        # torch.nn.init.normal(self.input_conv.weight, mean=0.0, std=0.02)
+        # torch.nn.init.constant(self.input_conv.bias, 0.0)
+
+        # torch.nn.init.normal(self.label_conv.weight, mean=0.0, std=0.02)
+        # torch.nn.init.constant(self.label_conv.bias, 0.0)
+        
         self.switches_normal = switches_normal
         switch_ons = []
         for i in range(len(switches_normal)):
@@ -100,8 +111,10 @@ class Network(nn.Module):
         self.switch_on = switch_ons[0]
 
         C_curr = stem_multiplier*C
+        
         self.network_head = nn.Sequential(
           nn.Linear(50, 32*32),
+          nn.BatchNorm1d(32*32),
           nn.LeakyReLU(0.2, inplace=True)
         )
 
@@ -125,23 +138,42 @@ class Network(nn.Module):
             reduction_prev = reduction
             self.cells += [cell]
             C_prev_prev, C_prev = C_prev, multiplier*C_curr
-
+            # print(C_prev)
+        
         self.global_pooling = nn.AdaptiveAvgPool2d(1)
         # self.classifier = nn.Linear(C_prev, num_classes)
         self.classifier = nn.Sequential(
             nn.Dropout(0.4),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(C_prev, 1)
+            nn.Linear(C_prev, 1),
+            nn.Sigmoid()
         )
 
         self._initialize_alphas()
 
     def forward(self, input, labels):
-        embed = self.label_embedding(labels)
-        head_in = self.network_head(embed)
-        head_in = head_in.view(-1,1,32,32)
-        head_in = torch.cat((input, head_in), dim=1)
-        s0 = s1 = self.stem(head_in)
+        input = input.view(input.size(0),3,32,32)
+        labels = self.label_embedding(labels)
+        head = self.network_head(labels)
+        head = head.view(-1,1,32,32)
+        cat = torch.cat((input, head), 1)
+        
+        # print(cat.size())
+        # print(labels.size())
+        # labels = labels.view(labels.size(0), -1, 1, 1)
+        # head = self.network_head(labels)
+        # labels = self.network_head(labels)
+        # head_in = self.network_head(labels)
+        # head_in = head_in.view(-1,1,32,32)
+        # print(input.size())
+        # print(head_in.size())
+        # h1 = self.input_conv(input)
+        # h2 = self.label_conv(head_in)
+        # x = torch.cat([h1, h2], 1)
+        # print(x.size())
+        # head_in = self.network_head(cat)
+        # head_in = head_in.view(-1,4,32,32)
+        # head_in = torch.cat((input, head_in), dim=1)
+        s0 = s1 = self.stem(cat)
         for i, cell in enumerate(self.cells):
             if cell.reduction:
                 if self.alphas_reduce.size(1) == 1:
@@ -155,7 +187,10 @@ class Network(nn.Module):
                     weights = F.softmax(self.alphas_normal, dim=-1)
             s0, s1 = s1, cell(s0, s1, weights)
         out = self.global_pooling(s1)
-        logits = self.classifier(out.view(out.size(0),-1))
+        out = out.view(out.size(0), -1)
+        # print(out.size())
+        logits = self.classifier(out)
+        # print(logits.size())
         return logits
 
     def update_p(self):

@@ -13,8 +13,11 @@ import torch.nn.functional as F
 import torchvision.datasets as dset
 import torch.backends.cudnn as cudnn
 import copy
+import torchvision.utils as vutils
+from torchvision.utils import save_image
 from torch.autograd import Variable
 from generator import Generator
+import torchvision.transforms as transforms
 from classifier_model import Resnet18
 from model_search import Network
 from genotypes import PRIMITIVES
@@ -29,7 +32,7 @@ parser.add_argument('--learning_rate', type=float, default=0.025, help='init lea
 parser.add_argument('--learning_rate_min', type=float, default=0.0, help='min learning rate')
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
 parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight decay')
-parser.add_argument('--report_freq', type=float, default=5, help='report frequency')
+parser.add_argument('--report_freq', type=float, default=50, help='report frequency')
 parser.add_argument('--epochs', type=int, default=25, help='num of training epochs')
 parser.add_argument('--init_channels', type=int, default=16, help='num of init channels')
 parser.add_argument('--layers', type=int, default=5, help='total number of layers')
@@ -44,12 +47,13 @@ parser.add_argument('--arch_learning_rate', type=float, default=6e-4, help='lear
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
 parser.add_argument('--tmp_data_dir', type=str, default='tmp', help='temp data dir')
 parser.add_argument('--note', type=str, default='try', help='note for this run')
-parser.add_argument('--dropout_rate', action='append', default=['0.1', '0.4', '0.7'], help='dropout rate of skip connect')
+# parser.add_argument('--add_layers', action='append', default=['0', '6', '12'], help='add layers')
+# parser.add_argument('--dropout_rate', action='append', default=['0.1', '0.4', '0.7'], help='dropout rate of skip connect')
+parser.add_argument('--add_layers', action='append', default=['8', '12', '12'], help='add layers')
+parser.add_argument('--dropout_rate', action='append', default=['0.4', '0.7', '0.7'], help='dropout rate of skip connect')
 parser.add_argument('--add_width', action='append', default=['0'], help='add channels')
-parser.add_argument('--add_layers', action='append', default=['0', '6', '12'], help='add layers')
 parser.add_argument('--c_lambda', type=float, default=0.05, help='cooperative learning coefficient')
 parser.add_argument('--cifar100', action='store_true', default=False, help='search with cifar100 dataset')
-
 
 parser.add_argument('--latent_dim', type=int, default=100, help='size of noise vector')
 parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
@@ -58,8 +62,8 @@ parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of firs
 
 args = parser.parse_args()
 
-args.save='{}log-{}-{}'.format(args.save, args.note, time.strftime("%Y%m%d-%H%M%S"))
-args.tmp_data_dir='{}data-{}-{}'.format(args.save, args.note, time.strftime("%Y%m%d-%H%M%S"))
+args.save= '/ceph/aseem-volume/datagan/search/1/logging'
+args.tmp_data_dir= '/ceph/aseem-volume/datagan/search/data'
 utils.create_exp_dir(args.save, scripts_to_save=glob.glob('*.py'))
 
 log_format = '%(asctime)s %(message)s'
@@ -80,17 +84,38 @@ cuda = True if torch.cuda.is_available() else False
 FloatTensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 LongTensor = torch.cuda.LongTensor if cuda else torch.LongTensor
 
-gamma = 0.01
+FT = torch.cuda.LongTensor
+FT_a = torch.cuda.FloatTensor
 
-def sample_image(n_row, batches_done):
+
+# Loss functions 
+a_loss = torch.nn.BCELoss()
+a_loss.cuda()
+
+# Labels 
+real_label = 0.9
+fake_label = 0.0
+
+gamma = 0.01
+lambda_gp = 10
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+def sample_image(gen, batches_done, n_row=10):
     """Saves a grid of generated digits ranging from 0 to n_classes"""
     # Sample noise
-    z = Variable(FloatTensor(np.random.normal(0, 1, (n_row ** 2, opt.latent_dim))))
+    z = Variable(FloatTensor(np.random.normal(0, 1, (n_row ** 2, args.latent_dim))))
     # Get labels ranging from 0 to n_classes for n rows
     labels = np.array([num for _ in range(n_row) for num in range(n_row)])
     labels = Variable(LongTensor(labels))
-    gen_imgs = generator(z, labels)
-    save_image(gen_imgs.data, "images/%d.png" % batches_done, nrow=n_row, normalize=True)
+    gen_imgs = gen(z, labels)
+    save_image(gen_imgs.data, "/ceph/aseem-volume/datagan/search/1/%d.png" % batches_done, nrow=n_row, normalize=True)
 
 def main():
     if not torch.cuda.is_available():
@@ -106,12 +131,29 @@ def main():
     if args.cifar100:
         train_transform, valid_transform = utils._data_transforms_cifar100(args)
     else:
-        train_transform, valid_transform = utils._data_transforms_cifar10(args)
+        # train_transform, valid_transform = utils._data_transforms_cifar10(args)
+        train_transform = transforms.Compose([transforms.Resize(32), 
+        transforms.ToTensor(), 
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+
+        valid_transform = transforms.Compose([transforms.Resize(32), 
+        transforms.ToTensor(), 
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+
     if args.cifar100:
         train_data = dset.CIFAR100(root=args.tmp_data_dir, train=True, download=True, transform=train_transform)
     else:
         train_data = dset.CIFAR10(root=args.tmp_data_dir, train=True, download=True, transform=train_transform)
 
+    label_dim = 10 
+    image_size = 32
+    # label preprocess
+    onehot = torch.zeros(label_dim, label_dim)
+    onehot = onehot.scatter_(1, torch.LongTensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]).view(label_dim, 1), 1).view(label_dim, label_dim, 1, 1)
+    fill = torch.zeros([label_dim, label_dim, image_size, image_size])
+    for i in range(label_dim):
+        fill[i, i, :, :] = 1
+        
     num_train = len(train_data)
     indices = list(range(num_train))
     split = int(np.floor(args.train_portion * num_train))
@@ -154,6 +196,46 @@ def main():
     else:
         drop_rate = [0.0, 0.0, 0.0]
     eps_no_archs = [10, 10, 10]
+        
+    # gen = Generator(100)
+    # gen.cuda()
+    # gen.apply(weights_init)
+
+    # logging.info("param size gen= %fMB", utils.count_parameters_in_MB(gen))
+
+    # optimizer_gen = torch.optim.Adam(gen.parameters(), lr=args.lr, 
+    #                     betas=(args.b1, args.b2))
+
+    # sp = 0
+    # disc = Network(args.init_channels + int(add_width[sp]), CIFAR_CLASSES, args.layers + int(add_layers[sp]), criterion, switches_normal=switches_normal, switches_reduce=switches_reduce, p=float(drop_rate[sp]))
+    # disc = nn.DataParallel(disc)
+    # disc = disc.cuda()
+    # logging.info("param size disc= %fMB", utils.count_parameters_in_MB(disc))
+    # network_params = []                                                         
+
+    # for k, v in disc.named_parameters():
+    #     if not (k.endswith('alphas_normal') or k.endswith('alphas_reduce')):
+    #         network_params.append(v)   
+        
+    # optimizer_disc = torch.optim.SGD(
+    #         network_params,
+    #         args.learning_rate,
+    #         momentum=args.momentum,
+    #         weight_decay=args.weight_decay)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #         optimizer_disc, float(args.epochs), eta_min=args.learning_rate_min)
+
+    # for epoch in range(100):
+
+    #     logging.info('Epoch: %d', epoch)
+    #     epoch_start = time.time()
+    #     train_acc, train_obj = train_gan(train_queue, valid_queue, gen, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, 0, 0, 0, 0, train_arch=True)
+    #     epoch_duration = time.time() - epoch_start
+    #     logging.info('Epoch time: %ds', epoch_duration)
+
+    # # utils.save(disc, os.path.join(args.save, 'disc_dump.pt'))
+    # utils.save(gen, os.path.join(args.save, 'gen_dump.pt'))
+    
     for sp in range(len(num_to_keep)):
 
         gen = Generator(100)
@@ -172,21 +254,24 @@ def main():
                             momentum=0.9, weight_decay=5e-4)
         scheduler_model = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_model, T_max=200)
 
+        sp = 0
         disc = Network(args.init_channels + int(add_width[sp]), CIFAR_CLASSES, args.layers + int(add_layers[sp]), criterion, switches_normal=switches_normal, switches_reduce=switches_reduce, p=float(drop_rate[sp]))
         disc = nn.DataParallel(disc)
         disc = disc.cuda()
         logging.info("param size disc= %fMB", utils.count_parameters_in_MB(disc))
-        network_params = []
+        network_params = []                                                          
 
         for k, v in disc.named_parameters():
             if not (k.endswith('alphas_normal') or k.endswith('alphas_reduce')):
                 network_params.append(v)   
             
-        optimizer_disc = torch.optim.SGD(
-                network_params,
-                args.learning_rate,
-                momentum=args.momentum,
-                weight_decay=args.weight_decay)
+        # optimizer_disc = torch.optim.SGD(
+        #         network_params,
+        #         args.learning_rate,
+        #         momentum=args.momentum,
+        #         weight_decay=args.weight_decay)
+        optimizer_disc = torch.optim.Adam(network_params, lr=args.lr, 
+                            betas=(args.b1, args.b2))
         optimizer_a = torch.optim.Adam(disc.module.arch_parameters(),
                     lr=args.arch_learning_rate, betas=(0.5, 0.999), weight_decay=args.arch_weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -197,9 +282,23 @@ def main():
         eps_no_arch = eps_no_archs[sp]
         scale_factor = 0.2
 
-        architect = Architect(gen, disc, model, network_params, criterion, args)
-        
-        for epoch in range(epochs):
+        # utils.load(disc, 'disc_dump.pt')
+        # utils.load(gen, os.path.join(args.save, 'gen_dump.pt'))
+
+        architect = Architect(gen, disc, model, network_params, criterion, adversarial_loss, CIFAR_CLASSES, args)
+
+
+        for epoch in range(100):
+
+            logging.info('Epoch: %d', epoch)
+            epoch_start = time.time()
+            train_acc, train_obj = train_gan(epoch, train_queue, valid_queue, gen, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, 0, 0, 0, 0, train_arch=True)
+            epoch_duration = time.time() - epoch_start
+            logging.info('Epoch time: %ds', epoch_duration)
+
+        # for epoch in range(epochs):
+        for epoch in range(0):
+
             scheduler.step()
             scheduler_model.step()
             lr_gen = args.lr
@@ -212,7 +311,7 @@ def main():
             if epoch < eps_no_arch:
                 disc.module.p = float(drop_rate[sp]) * (epochs - epoch - 1) / epochs
                 disc.module.update_p()
-                train_acc, train_obj = train(train_queue, valid_queue, architect, gen, model, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, optimizer_model, optimizer_a, lr, lr_model, lr_gen, lr_disc, train_arch=True)
+                train_acc, train_obj = train(train_queue, valid_queue, architect, gen, model, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, optimizer_model, optimizer_a, lr, lr_model, lr_gen, lr_disc, train_arch=False)
             else:
                 disc.module.p = float(drop_rate[sp]) * np.exp(-(epoch - eps_no_arch) * scale_factor) 
                 disc.module.update_p()                
@@ -222,9 +321,11 @@ def main():
             logging.info('Epoch time: %ds', epoch_duration)
             # validation
             if epochs - epoch < 5:
-                valid_acc, valid_obj = infer(valid_queue, disc, criterion)
+                valid_acc, valid_obj = infer(valid_queue, model, criterion)
                 logging.info('Valid_acc %f', valid_acc)
-        utils.save(disc, os.path.join(args.save, 'weights.pt'))
+        utils.save(disc, os.path.join(args.save, 'disc.pt'))
+        utils.save(gen, os.path.join(args.save, 'gen.pt'))
+        utils.save(model, os.path.join(args.save, 'model.pt'))
         print('------Dropping %d paths------' % num_to_drop[sp])
         # Save switches info for s-c refinement. 
         if sp == len(num_to_keep) - 1:
@@ -321,19 +422,21 @@ def main():
                 genotype = parse_network(switches_normal, switches_reduce)
                 logging.info(genotype)              
 
-def compute_gradient_penalty(D, real_samples, fake_samples):
+def compute_gradient_penalty(D, real_samples, fake_samples, labels):
     """Calculates the gradient penalty loss for WGAN GP"""
     # Random weight term for interpolation between real and fake samples
     alpha = torch.Tensor(np.random.random((real_samples.size(0), 1, 1, 1))).cuda()
+    labels = LongTensor(labels).cuda()
     
     real_samples.cuda()
     fake_samples.cuda()
     alpha.cuda()
+    
 
     # Get random interpolation between real and fake samples
     interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
     interpolates.cuda()
-    d_interpolates = D(interpolates)
+    d_interpolates = D(interpolates, labels)
     d_interpolates.cuda()
     fake = Variable(torch.Tensor(real_samples.shape[0], 1).cuda().fill_(1.0), requires_grad=False)
     fake.cuda()
@@ -383,11 +486,11 @@ def train(train_queue, valid_queue, architect, gen, model, disc, network_params,
             optimizer_disc.zero_grad()
             optimizer_model.zero_grad()
             
-            architect.step(input, target, input_search, target_search,lr,  lr_gen, lr_disc, lr_model, optimizer_model, optimizer_gen, optimizer_a)
+            architect.step(input, target, input_search, target_search, lr,  lr_gen, lr_disc, lr_model, optimizer_disc, optimizer_model, optimizer_gen, optimizer_a)
 
         # Adversarial ground truths
-        valid = Variable(FloatTensor(batch_size, 1).fill_(1.0), requires_grad=False)
-        fake = Variable(FloatTensor(batch_size, 1).fill_(0.0), requires_grad=False)
+        # valid = Variable(FloatTensor(batch_size, 1).fill_(1.0), requires_grad=False)
+        # fake = Variable(FloatTensor(batch_size, 1).fill_(0.0), requires_grad=False)
 
         # Configure input
         real_imgs = Variable(input.type(FloatTensor))
@@ -401,16 +504,17 @@ def train(train_queue, valid_queue, architect, gen, model, disc, network_params,
 
         # Sample noise and labels as generator input
         z = Variable(FloatTensor(np.random.normal(0, 1, (batch_size, args.latent_dim))))
-        gen_labels = Variable(LongTensor(np.random.randint(0, CIFAR_CLASSES, batch_size)))
+        # gen_labels = Variable(LongTensor(np.random.randint(0, CIFAR_CLASSES, batch_size)))
 
         # Generate a batch of images
-        gen_imgs = gen(z, gen_labels)
+        gen_imgs = gen(z, labels)
 
         # Loss measures generator's ability to fool the discriminator
-        validity = disc(gen_imgs, gen_labels)
-        g_loss = adversarial_loss(validity, valid)
+        validity = disc(gen_imgs, labels)
+        g_loss = -torch.mean(validity)
 
         g_loss.backward()
+        nn.utils.clip_grad_norm_(gen.parameters(), args.grad_clip)
         optimizer_gen.step()
 
         # ---------------------
@@ -421,19 +525,23 @@ def train(train_queue, valid_queue, architect, gen, model, disc, network_params,
 
         # Loss for real images
         validity_real = disc(real_imgs, labels)
-        d_real_loss = adversarial_loss(validity_real, valid)
+        # d_real_loss = adversarial_loss(validity_real, valid)
 
         # Loss for fake images
-        validity_fake = disc(gen_imgs.detach(), gen_labels)
-        d_fake_loss = adversarial_loss(validity_fake, fake)
+        validity_fake = disc(gen_imgs.detach(), labels)
+        # d_fake_loss = adversarial_loss(validity_fake, fake)
 
         # Total discriminator loss
-        d_loss = (d_real_loss + d_fake_loss) / 2
+        gradient_penalty = compute_gradient_penalty(disc, real_imgs.data, gen_imgs.data, labels.data)
+        # Total discriminator loss
+        d_loss = -torch.mean(validity_real) + torch.mean(validity_fake) + lambda_gp * gradient_penalty
 
         d_loss.backward()
             
         nn.utils.clip_grad_norm_(network_params, args.grad_clip)
         optimizer_disc.step()
+
+        optimizer_gen.zero_grad()
 
         # ---------------------
         #  Train Model
@@ -441,34 +549,168 @@ def train(train_queue, valid_queue, architect, gen, model, disc, network_params,
     
         optimizer_model.zero_grad()
 
-        loss = architect.compute_loss(input, target)
+        loss = architect.compute_loss(input, target, gen)
+        loss.backward()
 
         optimizer_model.step()
 
         logits = model(input)
+        loss = criterion(logits, target)
 
         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 1))
-        # objs.update(loss.data.item(), n)
+        objs.update(loss.data.item(), n)
         top1.update(prec1.data.item(), n)
         # top5.update(prec5.data.item(), n)
 
         if step % args.report_freq == 0:
+            sample_image(gen, step, 10)
             logging.info('TRAIN Step: %03d R1: %f Gen_loss: %f Disc_loss: %f Model_loss: %f', step, top1.avg, g_loss, d_loss, loss)
 
     return top1.avg, objs.avg
 
+def train_gan(epoch, train_queue, valid_queue, gen, disc, network_params, criterion, adversarial_loss, optimizer_gen, optimizer_disc, lr, lr_model, lr_gen, lr_disc, train_arch=True):
+    
+    for step, (input, target) in enumerate(train_queue):
+        batch_size = input.shape[0]
 
-def infer(valid_queue, disc, criterion):
+        input = input.cuda()
+        target = target.cuda(non_blocking=True)
+        
+        # convert img, labels into proper form 
+        imgs = Variable(input.type(FT_a))
+        labels = Variable(target.type(FT))
+
+        # creating real and fake tensors of labels 
+        reall = Variable(FT_a(batch_size,1).fill_(real_label))
+        f_label = Variable(FT_a(batch_size,1).fill_(fake_label))
+
+        # initializing gradient
+        optimizer_gen.zero_grad() 
+        optimizer_disc.zero_grad()
+
+        #### TRAINING GENERATOR ####
+        # Feeding generator noise and labels 
+        noise = Variable(FT_a(np.random.normal(0, 1,(batch_size, 100))))
+        gen_labels = Variable(FT(np.random.randint(0, 10, batch_size)))
+        
+        gen_imgs = gen(noise, gen_labels)
+        
+        # Ability for discriminator to discern the real v generated images 
+        validity = disc(gen_imgs, gen_labels)
+        
+        # Generative loss function 
+        # g_loss = a_loss(validity, reall)
+        g_loss = -torch.mean(validity)
+
+        # Gradients 
+        g_loss.backward()
+        optimizer_gen.step()
+
+
+        #### TRAINING DISCRIMINTOR ####
+
+        optimizer_disc.zero_grad()
+
+        # Loss for real images and labels 
+        validity_real = disc(imgs, labels)
+        # d_real_loss = a_loss(validity_real, reall)
+        d_real_loss = -torch.mean(validity_real)
+
+        # Loss for fake images and labels 
+        validity_fake = disc(gen_imgs.detach(), gen_labels)
+        d_fake_loss = torch.mean(validity_fake)
+
+        print("Real")
+        print(validity_real)
+        print("Fake")
+        print(validity_fake)
+        
+        gradient_penalty = compute_gradient_penalty(disc, imgs.data, gen_imgs.data, labels.data)
+        # Total discriminator loss 
+        d_loss = (d_fake_loss+d_real_loss) + 10 * gradient_penalty
+
+        # calculates discriminator gradients
+        d_loss.backward()
+        optimizer_disc.step()
+
+
+        # disc.train()
+        # n = input.size(0)
+        # batch_size = input.shape[0]
+        # input = input.cuda()
+        # target = target.cuda(non_blocking=True)
+        
+        # # Configure input
+        # real_imgs = Variable(input.type(FloatTensor))
+        # labels = Variable(target.type(LongTensor))
+
+        # # -----------------
+        # #  Train Generator
+        # # -----------------
+
+        # optimizer_gen.zero_grad()
+
+        # # Sample noise and labels as generator input
+        # z = Variable(FloatTensor(np.random.normal(0, 1, (batch_size, args.latent_dim))))
+        # # gen_labels = Variable(LongTensor(np.random.randint(0, CIFAR_CLASSES, batch_size)))
+
+        # # Generate a batch of images
+        # gen_imgs = gen(z, labels)
+
+        # # Loss measures generator's ability to fool the discriminator
+        # validity = disc(gen_imgs, labels)
+        # g_loss = -torch.mean(validity)
+
+        # g_loss.backward()
+        # nn.utils.clip_grad_norm_(gen.parameters(), args.grad_clip)
+        # optimizer_gen.step()
+
+        # # ---------------------
+        # #  Train Discriminator
+        # # ---------------------
+        
+        # optimizer_disc.zero_grad()
+
+        # # Loss for real images
+        # validity_real = disc(real_imgs, labels)
+        # # d_real_loss = adversarial_loss(validity_real, valid)
+
+        # # Loss for fake images
+        # validity_fake = disc(gen_imgs.detach(), labels)
+        # # d_fake_loss = adversarial_loss(validity_fake, fake)
+
+        # # Total discriminator loss
+        # gradient_penalty = compute_gradient_penalty(disc, real_imgs.data, gen_imgs.data, labels.data)
+        # # Total discriminator loss
+        # d_loss = -torch.mean(validity_real) + torch.mean(validity_fake) + lambda_gp * gradient_penalty
+
+        # d_loss.backward()
+            
+        # nn.utils.clip_grad_norm_(network_params, args.grad_clip)
+        # optimizer_disc.step()
+
+        # optimizer_gen.zero_grad()
+
+        if step % args.report_freq == 0:
+            # sample_image(gen, step, 10)
+            vutils.save_image(gen_imgs, '/ceph/aseem-volume/datagan/search/1/%s.png' % step, normalize=True)
+            fake = gen(noise, gen_labels)
+            vutils.save_image(fake.detach(), '/ceph/aseem-volume/datagan/search/1/%s_%03d.png' % (step, epoch), normalize=True)
+            logging.info('TRAIN Step: %03d Gen_loss: %f Disc_loss: %f', step, g_loss, d_loss)
+
+    return 0, 0
+
+def infer(valid_queue, model, criterion):
     objs = utils.AvgrageMeter()
     top1 = utils.AvgrageMeter()
     top5 = utils.AvgrageMeter()
-    disc.eval()
+    model.eval()
 
     for step, (input, target) in enumerate(valid_queue):
         input = input.cuda()
         target = target.cuda(non_blocking=True)
         with torch.no_grad():
-            logits = disc(input)
+            logits = model(input)
             loss = criterion(logits, target)
 
         prec1, prec5 = utils.accuracy(logits, target, topk=(1, 5))
